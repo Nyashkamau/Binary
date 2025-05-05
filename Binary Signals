@@ -1,0 +1,166 @@
+  # binary_signal_aggregator.py
+
+import requests
+from bs4 import BeautifulSoup
+import time
+import telegram
+import os
+from flask import Flask, render_template_string, jsonify
+import threading
+
+# --- CONFIGURATION SECTION --- #
+FXLEADERS_URL = 'https://www.fxleaders.com/'
+INVESTING_SIGNALS_URL = 'https://www.investing.com/technical/technical-summary'
+VFXALERT_FILE_PATH = '/path/to/vfxalert_signals.txt'  # Adjust this to your file location
+TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
+TELEGRAM_CHAT_ID = 'YOUR_TELEGRAM_CHAT_ID'
+CHECK_INTERVAL = 300  # in seconds (e.g., 300 = 5 minutes)
+
+bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+confirmed_signals_cache = []
+
+# --- SIGNAL SCRAPER FUNCTIONS --- #
+
+def scrape_fxleaders():
+    signals = []
+    try:
+        res = requests.get(FXLEADERS_URL, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        signal_boxes = soup.select('.signal-box')
+        for box in signal_boxes:
+            asset = box.select_one('.signal-asset').get_text(strip=True)
+            direction = box.select_one('.signal-direction').get_text(strip=True)
+            strength = box.select_one('.signal-strength').get_text(strip=True)
+            if direction.lower() in ['buy', 'sell']:
+                signals.append((asset, direction.upper(), strength))
+    except Exception as e:
+        print(f"[FXLeaders] Error: {e}")
+    return signals
+
+def scrape_investing():
+    signals = []
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(INVESTING_SIGNALS_URL, headers=headers, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        rows = soup.select('table tr')
+        for row in rows[1:]:
+            cells = row.find_all('td')
+            if len(cells) >= 5:
+                asset = cells[0].get_text(strip=True)
+                summary = cells[1].get_text(strip=True)
+                if summary.lower() in ['buy', 'sell', 'strong buy', 'strong sell']:
+                    direction = 'BUY' if 'buy' in summary.lower() else 'SELL'
+                    signals.append((asset, direction, summary))
+    except Exception as e:
+        print(f"[Investing] Error: {e}")
+    return signals
+
+def scrape_vfxalert():
+    signals = []
+    try:
+        if os.path.exists(VFXALERT_FILE_PATH):
+            with open(VFXALERT_FILE_PATH, 'r') as file:
+                for line in file.readlines():
+                    parts = line.strip().split(',')
+                    if len(parts) >= 2:
+                        asset = parts[0].strip()
+                        direction = parts[1].strip().upper()
+                        if direction in ['BUY', 'SELL']:
+                            signals.append((asset, direction, 'vfxAlert'))
+    except Exception as e:
+        print(f"[vfxAlert] Error: {e}")
+    return signals
+
+# --- SIGNAL CONFIRMATION --- #
+
+def confirm_signals(fx_signals, inv_signals, vfx_signals):
+    confirmed = []
+    for asset, fx_dir, fx_strength in fx_signals:
+        for inv_asset, inv_dir, inv_strength in inv_signals:
+            for vfx_asset, vfx_dir, vfx_strength in vfx_signals:
+                if (asset.lower().startswith(inv_asset.lower().split()[0]) and
+                    asset.lower().startswith(vfx_asset.lower().split()[0]) and
+                    fx_dir == inv_dir == vfx_dir):
+                    confirmed.append((asset, fx_dir, fx_strength, inv_strength, vfx_strength))
+    return confirmed
+
+# --- ALERT SYSTEM --- #
+
+def send_telegram_alert(signal_list):
+    if not signal_list:
+        return
+    for signal in signal_list:
+        asset, direction, fx_strength, inv_strength, vfx_strength = signal
+        message = f"\n📊 *Binary Signal Confirmed*\nAsset: `{asset}`\nDirection: *{direction}*\nFXLeaders: `{fx_strength}`\nInvesting.com: `{inv_strength}`\nvfxAlert: `{vfx_strength}`"
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode=telegram.ParseMode.MARKDOWN)
+
+# --- MAIN LOOP --- #
+
+def signal_worker():
+    global confirmed_signals_cache
+    while True:
+        print("[+] Checking for new signals...")
+        fx_data = scrape_fxleaders()
+        inv_data = scrape_investing()
+        vfx_data = scrape_vfxalert()
+        confirmed_signals = confirm_signals(fx_data, inv_data, vfx_data)
+        confirmed_signals_cache = confirmed_signals
+        send_telegram_alert(confirmed_signals)
+        print(f"[+] {len(confirmed_signals)} signals confirmed and sent.")
+        time.sleep(CHECK_INTERVAL)
+
+# --- WEB DASHBOARD --- #
+
+app = Flask(__name__)
+
+dashboard_template = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Binary Signal Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f2f2f2; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 12px; border: 1px solid #ccc; text-align: left; }
+        th { background-color: #333; color: #fff; }
+        tr:nth-child(even) { background-color: #eee; }
+    </style>
+</head>
+<body>
+    <h2>Confirmed Binary Signals</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Asset</th>
+                <th>Direction</th>
+                <th>FXLeaders</th>
+                <th>Investing</th>
+                <th>vfxAlert</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for signal in signals %}
+            <tr>
+                <td>{{ signal[0] }}</td>
+                <td>{{ signal[1] }}</td>
+                <td>{{ signal[2] }}</td>
+                <td>{{ signal[3] }}</td>
+                <td>{{ signal[4] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
+"""
+
+@app.route('/')
+def dashboard():
+    return render_template_string(dashboard_template, signals=confirmed_signals_cache)
+
+# --- APPLICATION ENTRY POINT --- #
+
+if __name__ == '__main__':
+    threading.Thread(target=signal_worker, daemon=True).start()
+    app.run(debug=False, host='0.0.0.0', port=8000)
